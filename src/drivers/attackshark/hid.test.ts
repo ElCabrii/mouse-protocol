@@ -120,6 +120,40 @@ test("X11 units whose battery report is hidden do not advertise a battery column
   assert.equal(status.ui?.forceShowBattery, false);
 });
 
+test("native X11 adapter writes polling over feature report 0x06", async () => {
+  const sent: Array<{ reportId: number; data: number[] }> = [];
+  const native = {
+    vendorId: 0x1d57,
+    productId: 0xfa60,
+    productName: "2.4G Wireless Device",
+    collections: [],
+    opened: false,
+    open() { (this as { opened: boolean }).opened = true; return Promise.resolve(); },
+    close() { (this as { opened: boolean }).opened = false; return Promise.resolve(); },
+    sendFeatureReport(reportId: number, data: BufferSource) {
+      sent.push({ reportId, data: [...new Uint8Array(data as ArrayBuffer)] });
+      return Promise.resolve();
+    },
+    receiveFeatureReport() { return Promise.resolve(new DataView(new ArrayBuffer(0))); },
+    addEventListener() { return undefined; },
+    removeEventListener() { return undefined; },
+  } as unknown as HIDDevice;
+
+  assert.equal(AttackSharkHidClient.isSupported(native), true);
+  const client = new AttackSharkHidClient(native);
+  const status = await client.readStatus();
+  assert.equal(status.name, "Attack Shark X11");
+  assert.equal(status.ui?.settingsReady, true);
+  assert.equal(status.ui?.statusNote, undefined);
+  assert.equal(status.ui?.forceShowBattery, true);
+  assert.equal(status.connectionType, "Wireless");
+  assert.deepEqual(status.supportedPollingRates, [125, 250, 500, 1000]);
+
+  const applied = await client.setPollingRate(500);
+  assert.equal(applied, 500);
+  assert.deepEqual(sent, [{ reportId: 0x06, data: [0x09, 0x01, 0x02, 0xfd, 0, 0, 0, 0] }]);
+});
+
 test("X11-family grants get a native-only explanation, other refusals do not", () => {
   const wireless = attackSharkNativeOnlyMessage([x11Entry(0xfa60, [[0x01, 0x06]])]);
   assert.match(wireless ?? "", /X11 \(wireless receiver\)/);

@@ -15,13 +15,14 @@ import { LAMZU_PRODUCTS } from "@openmouse/protocol/lamzu";
 // feature reports to the browser on any of its four HID entries. Its config
 // channel is USB interface 2 (a system-control/consumer composite; see the
 // lsusb dump in dressedinblack5/attack-shark-x11-electron docs/descritors),
-// and the reference driver bypasses the HID stack entirely: it claims
-// interface 2 with libusb, detaches the kernel HID driver on Linux, and on
-// Windows requires Zadig to swap the driver for WinUSB. A browser can do
-// none of that — WebHID sees no feature reports, and WebUSB refuses to
-// claim HID-class interfaces. The collection gate below therefore correctly
-// refuses these units; the X11-family helper further down turns that
-// refusal into a real explanation.
+// and WebHID only surfaces the Consumer collection, which declares none. The
+// config feature reports (0x06 polling, 0x04 DPI) are still reachable through
+// the OS HID stack on interface 2's `&col04` sub-collection: node-hid does
+// this on Windows with the stock input.inf (no Zadig/WinUSB), and the Tauri
+// Desktop app's Rust hidapi adapter opens every sub-collection path too. The
+// browser-side collection gate below therefore refuses these units, and the
+// X11-family helper turns that refusal into a real explanation; the
+// collections-less native branch writes the same packets over such an adapter.
 //
 // Protocol source: xb-bx/attack-shark-r1-driver (Odin)
 //                  HarukaYamamoto0/attack-shark-x11-driver (TypeScript)
@@ -150,6 +151,16 @@ type ProtocolFamily = "1d57" | "1d57-x11" | "25a7" | "373e" | null;
 
 function detectFamily(device: HIDDevice): ProtocolFamily {
   if (device.vendorId === VID_1D57) {
+    // Native HID adapters (Tauri's TauriHidDevice, the Node/Bridge adapter)
+    // cannot parse the report descriptor and report no collections at all,
+    // so every collection-based gate below would refuse these units. On that
+    // transport the vendor feature reports are reachable, so identify the
+    // family from the vendor/product id instead. WebHID always reports the
+    // real collection tree, so this branch never fires in a browser.
+    if (device.collections.length === 0) {
+      return X11_FAMILY_PIDS.has(device.productId) ? "1d57-x11" : null;
+    }
+
     // Some 0x1d57 mice (X8 SE, X11) use the GearHub protocol despite
     // sharing the R1 VID. Distinguish by checking for a vendor-specific
     // collection (usagePage 0xffff) which the GearHub interface exposes.
@@ -170,6 +181,10 @@ function detectFamily(device: HIDDevice): ProtocolFamily {
     return null;
   }
   if (device.vendorId === VID_25A7) {
+    // Same native-adapter reasoning as VID_1D57 above: with no report
+    // descriptor to inspect, the vendor id alone identifies the GearHub
+    // family.
+    if (device.collections.length === 0) return "25a7";
     return device.collections.some(hasVendorControl) ? "25a7" : null;
   }
   if (device.vendorId === VID_373E) {
@@ -223,6 +238,17 @@ export class AttackSharkHidClient {
   constructor(device: HIDDevice) {
     this.device = device;
     this.family = detectFamily(device);
+  }
+
+  /**
+   * True when this client is running over a native HID adapter (Tauri's
+   * TauriHidDevice, the Node/Bridge adapter) rather than WebHID. Those
+   * adapters report no collections, but unlike the browser they can reach
+   * the vendor feature reports, so the X11 config channel is writable
+   * through them.
+   */
+  private get nativeConfig(): boolean {
+    return this.device.collections.length === 0;
   }
 
   static isSupported(device: HIDDevice): boolean {
@@ -293,6 +319,9 @@ export class AttackSharkHidClient {
   getSupportedPollingRates(): number[] {
     if (this.family === "1d57") return POLLING_RATES_1D57.map(([, hz]) => hz);
     if (this.family === "25a7") return [...POLLING_CODES_25A7.keys()];
+    // Native transport: the X11 exposes the same 0x06 polling command the
+    // browser cannot reach, so advertise the rates it accepts.
+    if (this.family === "1d57-x11" && this.nativeConfig) return POLLING_RATES_1D57.map(([, hz]) => hz);
     return [];
   }
 
@@ -330,18 +359,21 @@ export class AttackSharkHidClient {
       name: this.displayName(),
       ui: {
         family: "attackshark",
-        settingsReady: this.family === "1d57" || this.family === "25a7",
+        settingsReady: this.family === "1d57"
+          || this.family === "25a7"
+          || (this.family === "1d57-x11" && this.nativeConfig),
         hideUnsupportedPollingRates: true,
         hideProcessingCard: true,
-        // Wireless X11-family units push battery on their own — but only
-        // show the column when the battery report is actually visible to
-        // the browser. On known units it is declared under the protected
-        // system-control collection, so Chrome hides it and the packet can
-        // never arrive; an always-empty battery column would just confuse.
+        // Wireless X11-family units push battery on their own. WebHID only
+        // shows the column when the browser can see the battery input report
+        // (usually hidden under the protected system-control collection); a
+        // native adapter delivers the stream directly, so it is always worth
+        // showing there.
         forceShowBattery: this.family === "1d57-x11"
           && this.isWireless()
-          && this.device.collections.some((collection) => declaresInputReport(collection, BATTERY_REPORT_ID)),
-        statusNote: this.family === "1d57-x11"
+          && (this.nativeConfig
+            || this.device.collections.some((collection) => declaresInputReport(collection, BATTERY_REPORT_ID))),
+        statusNote: this.family === "1d57-x11" && !this.nativeConfig
           ? "Status only: this mouse's settings channel is not reachable from a browser and needs a native driver."
           : undefined,
       },
@@ -359,10 +391,20 @@ export class AttackSharkHidClient {
 
   async setPollingRate(pollingRateHz: number): Promise<number> {
     if (this.family === "1d57-x11") {
-      throw new Error(
-        "This mouse's settings channel is not reachable from a browser; "
-        + "changing settings needs the native Attack Shark X11 driver.",
-      );
+      if (!this.nativeConfig) {
+        throw new Error(
+          "This mouse's settings channel is not reachable from a browser; "
+          + "changing settings needs the native Attack Shark X11 driver.",
+        );
+      }
+      // Native transport: the same 0x06 feature report the 0x1d57 (R1) path
+      // uses. This firmware exposes no read-back command, so trust the write
+      // and cache the value rather than confirming it.
+      const entry = POLLING_RATES_1D57.find(([, hz]) => hz === pollingRateHz);
+      if (!entry) throw new Error(`This mouse does not support ${pollingRateHz} Hz.`);
+      await this.write1d57PollingRate(entry[0]);
+      if (this.lastStatus) this.lastStatus = { ...this.lastStatus, pollingRateHz };
+      return pollingRateHz;
     }
     if (this.family === "1d57") {
       const entry = POLLING_RATES_1D57.find(([, hz]) => hz === pollingRateHz);
