@@ -1,6 +1,18 @@
 import type { MouseStatus } from "../mouse-types.ts";
 import { VENDOR_ID } from "../vendors.ts";
 import { LAMZU_PRODUCTS } from "@openmouse/protocol/lamzu";
+import {
+  buildX11DpiReport,
+  decodeX11DpiReport,
+  nearestX11Dpi,
+  X11_DPI_DEFAULT_ACTIVE,
+  X11_DPI_DEFAULT_STAGES,
+  X11_DPI_MAX,
+  X11_DPI_MIN,
+  X11_DPI_REPORT_ID,
+  X11_DPI_STAGE_COUNT,
+  X11_DPI_STEP,
+} from "./dpi.ts";
 
 // Attack Shark mice ship from multiple OEMs with different VIDs and protocols:
 //
@@ -15,13 +27,14 @@ import { LAMZU_PRODUCTS } from "@openmouse/protocol/lamzu";
 // feature reports to the browser on any of its four HID entries. Its config
 // channel is USB interface 2 (a system-control/consumer composite; see the
 // lsusb dump in dressedinblack5/attack-shark-x11-electron docs/descritors),
-// and the reference driver bypasses the HID stack entirely: it claims
-// interface 2 with libusb, detaches the kernel HID driver on Linux, and on
-// Windows requires Zadig to swap the driver for WinUSB. A browser can do
-// none of that — WebHID sees no feature reports, and WebUSB refuses to
-// claim HID-class interfaces. The collection gate below therefore correctly
-// refuses these units; the X11-family helper further down turns that
-// refusal into a real explanation.
+// and WebHID only surfaces the Consumer collection, which declares none. The
+// config feature reports (0x06 polling, 0x04 DPI) are still reachable through
+// the OS HID stack on interface 2's `&col04` sub-collection: node-hid does
+// this on Windows with the stock input.inf (no Zadig/WinUSB), and the Tauri
+// Desktop app's Rust hidapi adapter opens every sub-collection path too. The
+// browser-side collection gate below therefore refuses these units, and the
+// X11-family helper turns that refusal into a real explanation; the
+// collections-less native branch writes the same packets over such an adapter.
 //
 // Protocol source: xb-bx/attack-shark-r1-driver (Odin)
 //                  HarukaYamamoto0/attack-shark-x11-driver (TypeScript)
@@ -123,6 +136,78 @@ const X11_FAMILY_MODELS: ReadonlyMap<number, string> = new Map([
 // risks nothing. The wired PIDs never report battery on this endpoint.
 const X11_WIRELESS_PID = 0xfa60;
 
+// The X11 family's DPI report 0x04 is documented for the X11 (wired 0xfa55,
+// wireless 0xfa60). The R1 (0xfa61) uses a different DpiBuilder/step map in
+// the reference driver, so it stays out of this path until ported.
+const X11_DPI_PIDS: ReadonlySet<number> = new Set([0xfa55, 0xfa60]);
+
+// The firmware has no cheap "current DPI" command, so — exactly like the
+// reference driver — the last full six-stage table this process wrote (or
+// read back, when the read succeeds) is remembered here and re-sent whole on
+// every edit. Module-level because the desktop app opens a fresh short-lived
+// client per write and the table must survive between them.
+interface X11DpiState {
+  stages: number[];
+  activeStage: number;
+  angleSnap: boolean;
+  rippleControl: boolean;
+}
+
+const x11DpiStates = new Map<number, X11DpiState>();
+
+function x11DpiStateFor(productId: number): X11DpiState {
+  let state = x11DpiStates.get(productId);
+  if (!state) {
+    state = {
+      stages: [...X11_DPI_DEFAULT_STAGES],
+      activeStage: X11_DPI_DEFAULT_ACTIVE,
+      angleSnap: false,
+      rippleControl: true,
+    };
+    x11DpiStates.set(productId, state);
+  }
+  return state;
+}
+
+/** Test/diagnostic hook: forget cached X11 DPI state (defaults come back). */
+export function resetAttackSharkX11DpiState(): void {
+  x11DpiStates.clear();
+}
+
+// Battery and polling rate are both push/last-known rather than readable: the
+// receiver streams `03 55 40 01 <pct>` on interface 2 on its own, and the
+// firmware has no polling-rate read-back. This process keeps the last value it
+// saw per product id so a short-lived client can still report it. The X11's
+// reference driver and the web app's own X11 bridge both default the polling
+// rate to 1,000 Hz for the same reason.
+const X11_DEFAULT_POLLING_HZ = 1000;
+/** How long a battery sample stays fresh enough to skip waiting for another. */
+const X11_BATTERY_TTL_MS = 30_000;
+/** Longest a status read waits for the receiver's next battery packet. */
+const X11_BATTERY_WAIT_MS = 2_500;
+
+interface X11RuntimeState {
+  pollingRateHz: number;
+  batteryPercent: number | null;
+  batteryAt: number;
+}
+
+const x11RuntimeStates = new Map<number, X11RuntimeState>();
+
+function x11RuntimeFor(productId: number): X11RuntimeState {
+  let state = x11RuntimeStates.get(productId);
+  if (!state) {
+    state = { pollingRateHz: X11_DEFAULT_POLLING_HZ, batteryPercent: null, batteryAt: 0 };
+    x11RuntimeStates.set(productId, state);
+  }
+  return state;
+}
+
+/** Test/diagnostic hook: forget cached X11 battery/polling state. */
+export function resetAttackSharkX11RuntimeState(): void {
+  x11RuntimeStates.clear();
+}
+
 /**
  * If the granted devices include an X11-family unit that no driver could
  * claim, explain why instead of letting the generic "not a control
@@ -150,6 +235,16 @@ type ProtocolFamily = "1d57" | "1d57-x11" | "25a7" | "373e" | null;
 
 function detectFamily(device: HIDDevice): ProtocolFamily {
   if (device.vendorId === VID_1D57) {
+    // Native HID adapters (Tauri's TauriHidDevice, the Node/Bridge adapter)
+    // cannot parse the report descriptor and report no collections at all,
+    // so every collection-based gate below would refuse these units. On that
+    // transport the vendor feature reports are reachable, so identify the
+    // family from the vendor/product id instead. WebHID always reports the
+    // real collection tree, so this branch never fires in a browser.
+    if (device.collections.length === 0) {
+      return X11_FAMILY_PIDS.has(device.productId) ? "1d57-x11" : null;
+    }
+
     // Some 0x1d57 mice (X8 SE, X11) use the GearHub protocol despite
     // sharing the R1 VID. Distinguish by checking for a vendor-specific
     // collection (usagePage 0xffff) which the GearHub interface exposes.
@@ -170,6 +265,10 @@ function detectFamily(device: HIDDevice): ProtocolFamily {
     return null;
   }
   if (device.vendorId === VID_25A7) {
+    // Same native-adapter reasoning as VID_1D57 above: with no report
+    // descriptor to inspect, the vendor id alone identifies the GearHub
+    // family.
+    if (device.collections.length === 0) return "25a7";
     return device.collections.some(hasVendorControl) ? "25a7" : null;
   }
   if (device.vendorId === VID_373E) {
@@ -215,14 +314,34 @@ export class AttackSharkHidClient {
   readonly device: HIDDevice;
 
   private readonly family: ProtocolFamily;
+  private readonly batteryWaitMs: number;
   private lastStatus: MouseStatus | null = null;
   private queue: Promise<unknown> = Promise.resolve();
   private batteryPercent: number | null = null;
   private listening = false;
 
-  constructor(device: HIDDevice) {
+  constructor(device: HIDDevice, options: { batteryWaitMs?: number } = {}) {
     this.device = device;
     this.family = detectFamily(device);
+    this.batteryWaitMs = options.batteryWaitMs ?? X11_BATTERY_WAIT_MS;
+  }
+
+  /**
+   * True when this client is running over a native HID adapter (Tauri's
+   * TauriHidDevice, the Node/Bridge adapter) rather than WebHID. Those
+   * adapters report no collections, but unlike the browser they can reach
+   * the vendor feature reports, so the X11 config channel is writable
+   * through them.
+   */
+  private get nativeConfig(): boolean {
+    return this.device.collections.length === 0;
+  }
+
+  /** True when this unit's DPI report 0x04 can be driven over the native channel. */
+  private get x11DpiSupported(): boolean {
+    return this.family === "1d57-x11"
+      && this.nativeConfig
+      && X11_DPI_PIDS.has(this.device.productId);
   }
 
   static isSupported(device: HIDDevice): boolean {
@@ -240,6 +359,9 @@ export class AttackSharkHidClient {
     const percent = AttackSharkHidClient.parseBatteryReport(packet);
     if (percent !== null) {
       this.batteryPercent = percent;
+      const runtime = x11RuntimeFor(this.device.productId);
+      runtime.batteryPercent = percent;
+      runtime.batteryAt = Date.now();
       if (this.lastStatus) {
         this.lastStatus = { ...this.lastStatus, batteryPercent: percent, batteryState: "Discharging" };
       }
@@ -293,6 +415,9 @@ export class AttackSharkHidClient {
   getSupportedPollingRates(): number[] {
     if (this.family === "1d57") return POLLING_RATES_1D57.map(([, hz]) => hz);
     if (this.family === "25a7") return [...POLLING_CODES_25A7.keys()];
+    // Native transport: the X11 exposes the same 0x06 polling command the
+    // browser cannot reach, so advertise the rates it accepts.
+    if (this.family === "1d57-x11" && this.nativeConfig) return POLLING_RATES_1D57.map(([, hz]) => hz);
     return [];
   }
 
@@ -325,29 +450,69 @@ export class AttackSharkHidClient {
       }
     }
 
+    const dpiState = this.x11DpiSupported ? x11DpiStateFor(this.device.productId) : null;
+    if (dpiState) {
+      await this.readX11DpiState();
+      dpi = dpiState.stages[dpiState.activeStage - 1] ?? 0;
+    }
+
+    // Native X11: polling rate has no read-back (report the last value this
+    // process applied, defaulting to 1,000 Hz), and the wireless receiver
+    // pushes battery on its own — give it a bounded moment to arrive.
+    const x11Runtime = this.family === "1d57-x11" && this.nativeConfig
+      ? x11RuntimeFor(this.device.productId)
+      : null;
+    if (x11Runtime) {
+      if (this.isWireless()) await this.waitForX11Battery(x11Runtime);
+      pollingRateHz = x11Runtime.pollingRateHz;
+    }
+    const batteryPercent = x11Runtime ? x11Runtime.batteryPercent : this.batteryPercent;
+
     return this.lastStatus = {
       brand: "Attack Shark",
       name: this.displayName(),
       ui: {
         family: "attackshark",
-        settingsReady: this.family === "1d57" || this.family === "25a7",
+        settingsReady: this.family === "1d57"
+          || this.family === "25a7"
+          || (this.family === "1d57-x11" && this.nativeConfig),
         hideUnsupportedPollingRates: true,
         hideProcessingCard: true,
-        // Wireless X11-family units push battery on their own — but only
-        // show the column when the battery report is actually visible to
-        // the browser. On known units it is declared under the protected
-        // system-control collection, so Chrome hides it and the packet can
-        // never arrive; an always-empty battery column would just confuse.
+        // Wireless X11-family units push battery on their own. WebHID only
+        // shows the column when the browser can see the battery input report
+        // (usually hidden under the protected system-control collection); a
+        // native adapter delivers the stream directly, so it is always worth
+        // showing there.
         forceShowBattery: this.family === "1d57-x11"
           && this.isWireless()
-          && this.device.collections.some((collection) => declaresInputReport(collection, BATTERY_REPORT_ID)),
-        statusNote: this.family === "1d57-x11"
+          && (this.nativeConfig
+            || this.device.collections.some((collection) => declaresInputReport(collection, BATTERY_REPORT_ID))),
+        statusNote: this.family === "1d57-x11" && !this.nativeConfig
           ? "Status only: this mouse's settings channel is not reachable from a browser and needs a native driver."
           : undefined,
+        ...(dpiState
+          ? {
+            dpiStageEditor: {
+              maxStages: X11_DPI_STAGE_COUNT,
+              countEditable: false,
+              minDpi: X11_DPI_MIN,
+              maxDpi: X11_DPI_MAX,
+              stepDpi: X11_DPI_STEP,
+            },
+          }
+          : {}),
       },
-      batteryPercent: this.batteryPercent,
-      batteryState: this.batteryPercent !== null ? "Discharging" : "Unknown",
+      batteryPercent,
+      batteryState: batteryPercent !== null ? "Discharging" : "Unknown",
       dpi,
+      ...(dpiState
+        ? {
+          dpiStages: [...dpiState.stages],
+          activeDpiStage: dpiState.activeStage - 1,
+          angleSnapping: dpiState.angleSnap,
+          rippleControl: dpiState.rippleControl,
+        }
+        : {}),
       pollingRateHz,
       supportedPollingRates: this.getSupportedPollingRates(),
       activeProfile: null,
@@ -359,10 +524,21 @@ export class AttackSharkHidClient {
 
   async setPollingRate(pollingRateHz: number): Promise<number> {
     if (this.family === "1d57-x11") {
-      throw new Error(
-        "This mouse's settings channel is not reachable from a browser; "
-        + "changing settings needs the native Attack Shark X11 driver.",
-      );
+      if (!this.nativeConfig) {
+        throw new Error(
+          "This mouse's settings channel is not reachable from a browser; "
+          + "changing settings needs the native Attack Shark X11 driver.",
+        );
+      }
+      // Native transport: the same 0x06 feature report the 0x1d57 (R1) path
+      // uses. This firmware exposes no read-back command, so trust the write
+      // and cache the value rather than confirming it.
+      const entry = POLLING_RATES_1D57.find(([, hz]) => hz === pollingRateHz);
+      if (!entry) throw new Error(`This mouse does not support ${pollingRateHz} Hz.`);
+      await this.write1d57PollingRate(entry[0]);
+      x11RuntimeFor(this.device.productId).pollingRateHz = pollingRateHz;
+      if (this.lastStatus) this.lastStatus = { ...this.lastStatus, pollingRateHz };
+      return pollingRateHz;
     }
     if (this.family === "1d57") {
       const entry = POLLING_RATES_1D57.find(([, hz]) => hz === pollingRateHz);
@@ -383,6 +559,141 @@ export class AttackSharkHidClient {
       return pollingRateHz;
     }
     throw new Error("Polling rate control is not yet implemented for this Attack Shark model.");
+  }
+
+  // ── X11 DPI (report 0x04) ─────────────────────────────────────────────
+
+  /** Throw the same explanation the browser path gives when DPI cannot be driven. */
+  private requireX11Dpi(): void {
+    if (!this.x11DpiSupported) {
+      throw new Error(
+        this.family === "1d57-x11"
+          ? "This mouse's settings channel is not reachable from a browser; "
+            + "changing DPI needs the native Attack Shark X11 driver."
+          : "DPI control is not yet implemented for this Attack Shark model.",
+      );
+    }
+  }
+
+  /**
+   * Re-send the full six-stage table. The firmware has no partial update and
+   * no reliable read-back, so every edit carries the whole table — the same
+   * approach the reference driver takes.
+   */
+  private async writeX11Dpi(): Promise<void> {
+    const state = x11DpiStateFor(this.device.productId);
+    const report = buildX11DpiReport({
+      stages: state.stages,
+      activeStage: state.activeStage,
+      angleSnap: state.angleSnap,
+      rippleControl: state.rippleControl,
+      wired: this.device.productId === 0xfa55,
+    });
+    // The buffer's leading byte is the report id; WebHID/Tauri take it
+    // separately. Copy so the payload is a plain ArrayBuffer-backed view.
+    const payload = new Uint8Array(report.length - 1);
+    payload.set(report.subarray(1));
+    await this.run(() => this.device.sendFeatureReport(X11_DPI_REPORT_ID, payload));
+    await this.delay(CMD_DELAY_MS);
+  }
+
+  /**
+   * Best-effort read of the live table. The reference driver only documents
+   * this for the wireless receiver (a GET on report 0x04); the wired unit
+   * returns nothing. A failure leaves the cached table untouched rather than
+   * aborting the status read.
+   */
+  private async readX11DpiState(): Promise<void> {
+    if (this.device.productId === 0xfa55) return;
+    const state = x11DpiStateFor(this.device.productId);
+    try {
+      const view = await this.run(() => this.device.receiveFeatureReport(X11_DPI_REPORT_ID));
+      const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+      const decoded = decodeX11DpiReport(bytes);
+      if (!decoded) return;
+      state.stages = [...decoded.stages];
+      state.activeStage = decoded.activeStage;
+      state.angleSnap = decoded.angleSnap;
+      state.rippleControl = decoded.rippleControl;
+    } catch {
+      // No read-back on this firmware/transport; keep the cached table.
+    }
+  }
+
+  /**
+   * The wireless receiver streams battery on its own, so the only way to get
+   * a fresh percentage is to stay open for its next packet. Skip the wait when
+   * the last sample is still fresh — the desktop app re-reads every few
+   * seconds and should not pay this each time.
+   */
+  private async waitForX11Battery(runtime: X11RuntimeState): Promise<void> {
+    if (runtime.batteryPercent !== null && Date.now() - runtime.batteryAt < X11_BATTERY_TTL_MS) return;
+    const start = Date.now();
+    const deadline = start + this.batteryWaitMs;
+    while (Date.now() < deadline) {
+      await this.delay(100);
+      if (runtime.batteryPercent !== null && runtime.batteryAt >= start) return;
+    }
+  }
+
+  /** Sets the active stage's DPI, preserving the other five. */
+  async setDpi(dpi: number, _dpiY?: number): Promise<number> {
+    this.requireX11Dpi();
+    const state = x11DpiStateFor(this.device.productId);
+    const value = nearestX11Dpi(dpi);
+    state.stages[state.activeStage - 1] = value;
+    await this.writeX11Dpi();
+    if (this.lastStatus) this.lastStatus = { ...this.lastStatus, dpi: value };
+    return value;
+  }
+
+  /** Edits one stage's DPI. `stage` is 0-based, matching the shared UI contract. */
+  async setDpiStageValue(stage: number, dpi: number): Promise<number> {
+    this.requireX11Dpi();
+    if (!Number.isInteger(stage) || stage < 0 || stage >= X11_DPI_STAGE_COUNT) {
+      throw new RangeError(`This mouse has no DPI stage ${stage + 1}.`);
+    }
+    const state = x11DpiStateFor(this.device.productId);
+    const value = nearestX11Dpi(dpi);
+    state.stages[stage] = value;
+    await this.writeX11Dpi();
+    if (this.lastStatus) this.lastStatus = { ...this.lastStatus, dpiStages: [...state.stages] };
+    return value;
+  }
+
+  /** Selects the active stage. `stage` is 0-based, matching the shared UI contract. */
+  async setActiveDpiStage(stage: number): Promise<number> {
+    this.requireX11Dpi();
+    if (!Number.isInteger(stage) || stage < 0 || stage >= X11_DPI_STAGE_COUNT) {
+      throw new RangeError(`This mouse has no DPI stage ${stage + 1}.`);
+    }
+    const state = x11DpiStateFor(this.device.productId);
+    state.activeStage = stage + 1;
+    await this.writeX11Dpi();
+    if (this.lastStatus) {
+      this.lastStatus = {
+        ...this.lastStatus,
+        dpi: state.stages[stage] ?? this.lastStatus.dpi,
+        activeDpiStage: stage,
+      };
+    }
+    return stage;
+  }
+
+  async setAngleSnapping(enabled: boolean): Promise<boolean> {
+    this.requireX11Dpi();
+    x11DpiStateFor(this.device.productId).angleSnap = enabled;
+    await this.writeX11Dpi();
+    if (this.lastStatus) this.lastStatus = { ...this.lastStatus, angleSnapping: enabled };
+    return enabled;
+  }
+
+  async setRippleControl(enabled: boolean): Promise<boolean> {
+    this.requireX11Dpi();
+    x11DpiStateFor(this.device.productId).rippleControl = enabled;
+    await this.writeX11Dpi();
+    if (this.lastStatus) this.lastStatus = { ...this.lastStatus, rippleControl: enabled };
+    return enabled;
   }
 
   // ── 0x25a7 low-level ──────────────────────────────────────────────────
