@@ -174,6 +174,40 @@ export function resetAttackSharkX11DpiState(): void {
   x11DpiStates.clear();
 }
 
+// Battery and polling rate are both push/last-known rather than readable: the
+// receiver streams `03 55 40 01 <pct>` on interface 2 on its own, and the
+// firmware has no polling-rate read-back. This process keeps the last value it
+// saw per product id so a short-lived client can still report it. The X11's
+// reference driver and the web app's own X11 bridge both default the polling
+// rate to 1,000 Hz for the same reason.
+const X11_DEFAULT_POLLING_HZ = 1000;
+/** How long a battery sample stays fresh enough to skip waiting for another. */
+const X11_BATTERY_TTL_MS = 30_000;
+/** Longest a status read waits for the receiver's next battery packet. */
+const X11_BATTERY_WAIT_MS = 2_500;
+
+interface X11RuntimeState {
+  pollingRateHz: number;
+  batteryPercent: number | null;
+  batteryAt: number;
+}
+
+const x11RuntimeStates = new Map<number, X11RuntimeState>();
+
+function x11RuntimeFor(productId: number): X11RuntimeState {
+  let state = x11RuntimeStates.get(productId);
+  if (!state) {
+    state = { pollingRateHz: X11_DEFAULT_POLLING_HZ, batteryPercent: null, batteryAt: 0 };
+    x11RuntimeStates.set(productId, state);
+  }
+  return state;
+}
+
+/** Test/diagnostic hook: forget cached X11 battery/polling state. */
+export function resetAttackSharkX11RuntimeState(): void {
+  x11RuntimeStates.clear();
+}
+
 /**
  * If the granted devices include an X11-family unit that no driver could
  * claim, explain why instead of letting the generic "not a control
@@ -280,14 +314,16 @@ export class AttackSharkHidClient {
   readonly device: HIDDevice;
 
   private readonly family: ProtocolFamily;
+  private readonly batteryWaitMs: number;
   private lastStatus: MouseStatus | null = null;
   private queue: Promise<unknown> = Promise.resolve();
   private batteryPercent: number | null = null;
   private listening = false;
 
-  constructor(device: HIDDevice) {
+  constructor(device: HIDDevice, options: { batteryWaitMs?: number } = {}) {
     this.device = device;
     this.family = detectFamily(device);
+    this.batteryWaitMs = options.batteryWaitMs ?? X11_BATTERY_WAIT_MS;
   }
 
   /**
@@ -323,6 +359,9 @@ export class AttackSharkHidClient {
     const percent = AttackSharkHidClient.parseBatteryReport(packet);
     if (percent !== null) {
       this.batteryPercent = percent;
+      const runtime = x11RuntimeFor(this.device.productId);
+      runtime.batteryPercent = percent;
+      runtime.batteryAt = Date.now();
       if (this.lastStatus) {
         this.lastStatus = { ...this.lastStatus, batteryPercent: percent, batteryState: "Discharging" };
       }
@@ -417,6 +456,18 @@ export class AttackSharkHidClient {
       dpi = dpiState.stages[dpiState.activeStage - 1] ?? 0;
     }
 
+    // Native X11: polling rate has no read-back (report the last value this
+    // process applied, defaulting to 1,000 Hz), and the wireless receiver
+    // pushes battery on its own — give it a bounded moment to arrive.
+    const x11Runtime = this.family === "1d57-x11" && this.nativeConfig
+      ? x11RuntimeFor(this.device.productId)
+      : null;
+    if (x11Runtime) {
+      if (this.isWireless()) await this.waitForX11Battery(x11Runtime);
+      pollingRateHz = x11Runtime.pollingRateHz;
+    }
+    const batteryPercent = x11Runtime ? x11Runtime.batteryPercent : this.batteryPercent;
+
     return this.lastStatus = {
       brand: "Attack Shark",
       name: this.displayName(),
@@ -451,8 +502,8 @@ export class AttackSharkHidClient {
           }
           : {}),
       },
-      batteryPercent: this.batteryPercent,
-      batteryState: this.batteryPercent !== null ? "Discharging" : "Unknown",
+      batteryPercent,
+      batteryState: batteryPercent !== null ? "Discharging" : "Unknown",
       dpi,
       ...(dpiState
         ? {
@@ -485,6 +536,7 @@ export class AttackSharkHidClient {
       const entry = POLLING_RATES_1D57.find(([, hz]) => hz === pollingRateHz);
       if (!entry) throw new Error(`This mouse does not support ${pollingRateHz} Hz.`);
       await this.write1d57PollingRate(entry[0]);
+      x11RuntimeFor(this.device.productId).pollingRateHz = pollingRateHz;
       if (this.lastStatus) this.lastStatus = { ...this.lastStatus, pollingRateHz };
       return pollingRateHz;
     }
@@ -565,6 +617,22 @@ export class AttackSharkHidClient {
       state.rippleControl = decoded.rippleControl;
     } catch {
       // No read-back on this firmware/transport; keep the cached table.
+    }
+  }
+
+  /**
+   * The wireless receiver streams battery on its own, so the only way to get
+   * a fresh percentage is to stay open for its next packet. Skip the wait when
+   * the last sample is still fresh — the desktop app re-reads every few
+   * seconds and should not pay this each time.
+   */
+  private async waitForX11Battery(runtime: X11RuntimeState): Promise<void> {
+    if (runtime.batteryPercent !== null && Date.now() - runtime.batteryAt < X11_BATTERY_TTL_MS) return;
+    const start = Date.now();
+    const deadline = start + this.batteryWaitMs;
+    while (Date.now() < deadline) {
+      await this.delay(100);
+      if (runtime.batteryPercent !== null && runtime.batteryAt >= start) return;
     }
   }
 

@@ -7,6 +7,7 @@ import {
   checksum25a7,
   POLLING_CODES_25A7,
   resetAttackSharkX11DpiState,
+  resetAttackSharkX11RuntimeState,
 } from "./hid.ts";
 
 function device(vendorId: number, usagePage = 0xffff): HIDDevice {
@@ -123,7 +124,9 @@ test("X11 units whose battery report is hidden do not advertise a battery column
 
 test("native X11 adapter writes polling over 0x06 and DPI over 0x04", async () => {
   resetAttackSharkX11DpiState();
+  resetAttackSharkX11RuntimeState();
   const sent: Array<{ reportId: number; data: number[] }> = [];
+  const listeners = new Map<string, (event: { reportId: number; data: DataView }) => void>();
   const native = {
     vendorId: 0x1d57,
     productId: 0xfa60,
@@ -137,12 +140,14 @@ test("native X11 adapter writes polling over 0x06 and DPI over 0x04", async () =
       return Promise.resolve();
     },
     receiveFeatureReport() { return Promise.resolve(new DataView(new ArrayBuffer(0))); },
-    addEventListener() { return undefined; },
-    removeEventListener() { return undefined; },
+    addEventListener(type: string, listener: (event: { reportId: number; data: DataView }) => void) {
+      listeners.set(type, listener);
+    },
+    removeEventListener(type: string) { listeners.delete(type); },
   } as unknown as HIDDevice;
 
   assert.equal(AttackSharkHidClient.isSupported(native), true);
-  const client = new AttackSharkHidClient(native);
+  const client = new AttackSharkHidClient(native, { batteryWaitMs: 0 });
   const status = await client.readStatus();
   assert.equal(status.name, "Attack Shark X11");
   assert.equal(status.ui?.settingsReady, true);
@@ -150,6 +155,9 @@ test("native X11 adapter writes polling over 0x06 and DPI over 0x04", async () =
   assert.equal(status.ui?.forceShowBattery, true);
   assert.equal(status.connectionType, "Wireless");
   assert.deepEqual(status.supportedPollingRates, [125, 250, 500, 1000]);
+  // No read-back for polling: the last-applied/default 1,000 Hz is reported.
+  assert.equal(status.pollingRateHz, 1000);
+  assert.equal(status.batteryPercent, null);
 
   // DPI defaults: active stage 2 (1-based) => 1,600 DPI, with the shared
   // six-stage editor exposed.
@@ -174,6 +182,15 @@ test("native X11 adapter writes polling over 0x06 and DPI over 0x04", async () =
   assert.deepEqual(sent[0].data.slice(0, 2), [0x38, 0x01]);
   // Stage 2 is at payload index 8; 3,200 encodes to 0x4b.
   assert.equal(sent[0].data[8], 0x4b);
+
+  // The receiver's autonomous battery packet updates the cached status, and
+  // the applied polling rate survives into the next read via module state.
+  const payload = new Uint8Array([0x55, 0x40, 0x01, 0x50]);
+  listeners.get("inputreport")?.({ reportId: 0x03, data: new DataView(payload.buffer) });
+  const withBattery = await client.readStatus();
+  assert.equal(withBattery.batteryPercent, 80);
+  assert.equal(withBattery.batteryState, "Discharging");
+  assert.equal(withBattery.pollingRateHz, 500);
 });
 
 test("X11-family grants get a native-only explanation, other refusals do not", () => {
