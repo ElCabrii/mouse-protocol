@@ -6,6 +6,7 @@ import {
   attackSharkNativeOnlyMessage,
   checksum25a7,
   POLLING_CODES_25A7,
+  resetAttackSharkX11DpiState,
 } from "./hid.ts";
 
 function device(vendorId: number, usagePage = 0xffff): HIDDevice {
@@ -120,7 +121,8 @@ test("X11 units whose battery report is hidden do not advertise a battery column
   assert.equal(status.ui?.forceShowBattery, false);
 });
 
-test("native X11 adapter writes polling over feature report 0x06", async () => {
+test("native X11 adapter writes polling over 0x06 and DPI over 0x04", async () => {
+  resetAttackSharkX11DpiState();
   const sent: Array<{ reportId: number; data: number[] }> = [];
   const native = {
     vendorId: 0x1d57,
@@ -149,9 +151,29 @@ test("native X11 adapter writes polling over feature report 0x06", async () => {
   assert.equal(status.connectionType, "Wireless");
   assert.deepEqual(status.supportedPollingRates, [125, 250, 500, 1000]);
 
+  // DPI defaults: active stage 2 (1-based) => 1,600 DPI, with the shared
+  // six-stage editor exposed.
+  assert.equal(status.dpi, 1600);
+  assert.deepEqual(status.dpiStages, [800, 1600, 2400, 3200, 5000, 22000]);
+  assert.equal(status.activeDpiStage, 1);
+  assert.equal(status.angleSnapping, false);
+  assert.equal(status.rippleControl, true);
+  assert.deepEqual(status.ui?.dpiStageEditor, {
+    maxStages: 6, countEditable: false, minDpi: 50, maxDpi: 22000, stepDpi: 50,
+  });
+
   const applied = await client.setPollingRate(500);
   assert.equal(applied, 500);
   assert.deepEqual(sent, [{ reportId: 0x06, data: [0x09, 0x01, 0x02, 0xfd, 0, 0, 0, 0] }]);
+
+  // DPI write: report 0x04, payload without the leading report id.
+  sent.length = 0;
+  assert.equal(await client.setDpi(3200), 3200);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].reportId, 0x04);
+  assert.deepEqual(sent[0].data.slice(0, 2), [0x38, 0x01]);
+  // Stage 2 is at payload index 8; 3,200 encodes to 0x4b.
+  assert.equal(sent[0].data[8], 0x4b);
 });
 
 test("X11-family grants get a native-only explanation, other refusals do not", () => {

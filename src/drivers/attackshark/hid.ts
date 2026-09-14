@@ -1,6 +1,18 @@
 import type { MouseStatus } from "../mouse-types.ts";
 import { VENDOR_ID } from "../vendors.ts";
 import { LAMZU_PRODUCTS } from "@openmouse/protocol/lamzu";
+import {
+  buildX11DpiReport,
+  decodeX11DpiReport,
+  nearestX11Dpi,
+  X11_DPI_DEFAULT_ACTIVE,
+  X11_DPI_DEFAULT_STAGES,
+  X11_DPI_MAX,
+  X11_DPI_MIN,
+  X11_DPI_REPORT_ID,
+  X11_DPI_STAGE_COUNT,
+  X11_DPI_STEP,
+} from "./dpi.ts";
 
 // Attack Shark mice ship from multiple OEMs with different VIDs and protocols:
 //
@@ -123,6 +135,44 @@ const X11_FAMILY_MODELS: ReadonlyMap<number, string> = new Map([
 // no command needed — so a read-only claim of that entry costs nothing and
 // risks nothing. The wired PIDs never report battery on this endpoint.
 const X11_WIRELESS_PID = 0xfa60;
+
+// The X11 family's DPI report 0x04 is documented for the X11 (wired 0xfa55,
+// wireless 0xfa60). The R1 (0xfa61) uses a different DpiBuilder/step map in
+// the reference driver, so it stays out of this path until ported.
+const X11_DPI_PIDS: ReadonlySet<number> = new Set([0xfa55, 0xfa60]);
+
+// The firmware has no cheap "current DPI" command, so — exactly like the
+// reference driver — the last full six-stage table this process wrote (or
+// read back, when the read succeeds) is remembered here and re-sent whole on
+// every edit. Module-level because the desktop app opens a fresh short-lived
+// client per write and the table must survive between them.
+interface X11DpiState {
+  stages: number[];
+  activeStage: number;
+  angleSnap: boolean;
+  rippleControl: boolean;
+}
+
+const x11DpiStates = new Map<number, X11DpiState>();
+
+function x11DpiStateFor(productId: number): X11DpiState {
+  let state = x11DpiStates.get(productId);
+  if (!state) {
+    state = {
+      stages: [...X11_DPI_DEFAULT_STAGES],
+      activeStage: X11_DPI_DEFAULT_ACTIVE,
+      angleSnap: false,
+      rippleControl: true,
+    };
+    x11DpiStates.set(productId, state);
+  }
+  return state;
+}
+
+/** Test/diagnostic hook: forget cached X11 DPI state (defaults come back). */
+export function resetAttackSharkX11DpiState(): void {
+  x11DpiStates.clear();
+}
 
 /**
  * If the granted devices include an X11-family unit that no driver could
@@ -251,6 +301,13 @@ export class AttackSharkHidClient {
     return this.device.collections.length === 0;
   }
 
+  /** True when this unit's DPI report 0x04 can be driven over the native channel. */
+  private get x11DpiSupported(): boolean {
+    return this.family === "1d57-x11"
+      && this.nativeConfig
+      && X11_DPI_PIDS.has(this.device.productId);
+  }
+
   static isSupported(device: HIDDevice): boolean {
     return detectFamily(device) !== null;
   }
@@ -354,6 +411,12 @@ export class AttackSharkHidClient {
       }
     }
 
+    const dpiState = this.x11DpiSupported ? x11DpiStateFor(this.device.productId) : null;
+    if (dpiState) {
+      await this.readX11DpiState();
+      dpi = dpiState.stages[dpiState.activeStage - 1] ?? 0;
+    }
+
     return this.lastStatus = {
       brand: "Attack Shark",
       name: this.displayName(),
@@ -376,10 +439,29 @@ export class AttackSharkHidClient {
         statusNote: this.family === "1d57-x11" && !this.nativeConfig
           ? "Status only: this mouse's settings channel is not reachable from a browser and needs a native driver."
           : undefined,
+        ...(dpiState
+          ? {
+            dpiStageEditor: {
+              maxStages: X11_DPI_STAGE_COUNT,
+              countEditable: false,
+              minDpi: X11_DPI_MIN,
+              maxDpi: X11_DPI_MAX,
+              stepDpi: X11_DPI_STEP,
+            },
+          }
+          : {}),
       },
       batteryPercent: this.batteryPercent,
       batteryState: this.batteryPercent !== null ? "Discharging" : "Unknown",
       dpi,
+      ...(dpiState
+        ? {
+          dpiStages: [...dpiState.stages],
+          activeDpiStage: dpiState.activeStage - 1,
+          angleSnapping: dpiState.angleSnap,
+          rippleControl: dpiState.rippleControl,
+        }
+        : {}),
       pollingRateHz,
       supportedPollingRates: this.getSupportedPollingRates(),
       activeProfile: null,
@@ -425,6 +507,125 @@ export class AttackSharkHidClient {
       return pollingRateHz;
     }
     throw new Error("Polling rate control is not yet implemented for this Attack Shark model.");
+  }
+
+  // ── X11 DPI (report 0x04) ─────────────────────────────────────────────
+
+  /** Throw the same explanation the browser path gives when DPI cannot be driven. */
+  private requireX11Dpi(): void {
+    if (!this.x11DpiSupported) {
+      throw new Error(
+        this.family === "1d57-x11"
+          ? "This mouse's settings channel is not reachable from a browser; "
+            + "changing DPI needs the native Attack Shark X11 driver."
+          : "DPI control is not yet implemented for this Attack Shark model.",
+      );
+    }
+  }
+
+  /**
+   * Re-send the full six-stage table. The firmware has no partial update and
+   * no reliable read-back, so every edit carries the whole table — the same
+   * approach the reference driver takes.
+   */
+  private async writeX11Dpi(): Promise<void> {
+    const state = x11DpiStateFor(this.device.productId);
+    const report = buildX11DpiReport({
+      stages: state.stages,
+      activeStage: state.activeStage,
+      angleSnap: state.angleSnap,
+      rippleControl: state.rippleControl,
+      wired: this.device.productId === 0xfa55,
+    });
+    // The buffer's leading byte is the report id; WebHID/Tauri take it
+    // separately. Copy so the payload is a plain ArrayBuffer-backed view.
+    const payload = new Uint8Array(report.length - 1);
+    payload.set(report.subarray(1));
+    await this.run(() => this.device.sendFeatureReport(X11_DPI_REPORT_ID, payload));
+    await this.delay(CMD_DELAY_MS);
+  }
+
+  /**
+   * Best-effort read of the live table. The reference driver only documents
+   * this for the wireless receiver (a GET on report 0x04); the wired unit
+   * returns nothing. A failure leaves the cached table untouched rather than
+   * aborting the status read.
+   */
+  private async readX11DpiState(): Promise<void> {
+    if (this.device.productId === 0xfa55) return;
+    const state = x11DpiStateFor(this.device.productId);
+    try {
+      const view = await this.run(() => this.device.receiveFeatureReport(X11_DPI_REPORT_ID));
+      const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+      const decoded = decodeX11DpiReport(bytes);
+      if (!decoded) return;
+      state.stages = [...decoded.stages];
+      state.activeStage = decoded.activeStage;
+      state.angleSnap = decoded.angleSnap;
+      state.rippleControl = decoded.rippleControl;
+    } catch {
+      // No read-back on this firmware/transport; keep the cached table.
+    }
+  }
+
+  /** Sets the active stage's DPI, preserving the other five. */
+  async setDpi(dpi: number, _dpiY?: number): Promise<number> {
+    this.requireX11Dpi();
+    const state = x11DpiStateFor(this.device.productId);
+    const value = nearestX11Dpi(dpi);
+    state.stages[state.activeStage - 1] = value;
+    await this.writeX11Dpi();
+    if (this.lastStatus) this.lastStatus = { ...this.lastStatus, dpi: value };
+    return value;
+  }
+
+  /** Edits one stage's DPI. `stage` is 0-based, matching the shared UI contract. */
+  async setDpiStageValue(stage: number, dpi: number): Promise<number> {
+    this.requireX11Dpi();
+    if (!Number.isInteger(stage) || stage < 0 || stage >= X11_DPI_STAGE_COUNT) {
+      throw new RangeError(`This mouse has no DPI stage ${stage + 1}.`);
+    }
+    const state = x11DpiStateFor(this.device.productId);
+    const value = nearestX11Dpi(dpi);
+    state.stages[stage] = value;
+    await this.writeX11Dpi();
+    if (this.lastStatus) this.lastStatus = { ...this.lastStatus, dpiStages: [...state.stages] };
+    return value;
+  }
+
+  /** Selects the active stage. `stage` is 0-based, matching the shared UI contract. */
+  async setActiveDpiStage(stage: number): Promise<number> {
+    this.requireX11Dpi();
+    if (!Number.isInteger(stage) || stage < 0 || stage >= X11_DPI_STAGE_COUNT) {
+      throw new RangeError(`This mouse has no DPI stage ${stage + 1}.`);
+    }
+    const state = x11DpiStateFor(this.device.productId);
+    state.activeStage = stage + 1;
+    await this.writeX11Dpi();
+    if (this.lastStatus) {
+      this.lastStatus = {
+        ...this.lastStatus,
+        dpi: state.stages[stage] ?? this.lastStatus.dpi,
+        activeDpiStage: stage,
+      };
+    }
+    return stage;
+  }
+
+  async setAngleSnapping(enabled: boolean): Promise<boolean> {
+    this.requireX11Dpi();
+    x11DpiStateFor(this.device.productId).angleSnap = enabled;
+    await this.writeX11Dpi();
+    if (this.lastStatus) this.lastStatus = { ...this.lastStatus, angleSnapping: enabled };
+    return enabled;
+  }
+
+  async setRippleControl(enabled: boolean): Promise<boolean> {
+    this.requireX11Dpi();
+    x11DpiStateFor(this.device.productId).rippleControl = enabled;
+    await this.writeX11Dpi();
+    if (this.lastStatus) this.lastStatus = { ...this.lastStatus, rippleControl: enabled };
+    return enabled;
   }
 
   // ── 0x25a7 low-level ──────────────────────────────────────────────────
