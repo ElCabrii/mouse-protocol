@@ -73,6 +73,10 @@
       "types": "./dist/orbital/index.d.ts",
       "import": "./dist/orbital/index.js"
     },
+    "./rawm": {
+      "types": "./dist/rawm/index.d.ts",
+      "import": "./dist/rawm/index.js"
+    },
     "./pulsar": {
       "types": "./dist/pulsar/index.d.ts",
       "import": "./dist/pulsar/index.js"

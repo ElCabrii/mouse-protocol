@@ -90,6 +90,7 @@ import {
   HYPERX_VENDOR_ID_HP,
   HYPERX_VENDOR_ID_KINGSTON,
 } from "@openmouse/protocol/hyperx";
+import { RAWM_PRODUCT_IDS, RAWM_USAGE, RAWM_USAGE_PAGE, RAWM_VENDOR_ID } from "@openmouse/protocol/rawm";
 
 export const VENDOR_ID = {
   asus: ASUS_VENDOR_ID,
@@ -101,6 +102,7 @@ export const VENDOR_ID = {
   attackshark: 0x373e,
   logitech: 0x046d,
   orbital: 0x1915,
+  rawm: RAWM_VENDOR_ID,
   razer: 0x1532,
   teevolution: 0x3554,
   vgn: 0x3554,
@@ -666,6 +668,12 @@ export const SUPPORTED_HID_FILTERS: HIDDeviceFilter[] = [
   { vendorId: VENDOR_ID.lamzu },
   ...LAMZU_INCA_HID_FILTERS,
   { vendorId: VENDOR_ID.orbital, usagePage: 0xff0a, usage: 1 },
+  ...[...RAWM_PRODUCT_IDS].map((productId) => ({
+    vendorId: VENDOR_ID.rawm,
+    productId,
+    usagePage: RAWM_USAGE_PAGE,
+    usage: RAWM_USAGE,
+  })),
   // MCHOSE ships keyboards and audio devices under 0x3837 too, so this stays
   // narrowed to the mouse configuration collection rather than the whole VID.
   ...MCHOSE_A5_HID_FILTERS,
