@@ -58,6 +58,55 @@ test("recognizes a Model D Wireless whose config lives on the 0xffff:0 collectio
   assert.equal(GloriousClassicHidClient.isSupported(device), true);
 });
 
+test("recognizes a Model O V2 Wired whose config channel is numbered report 7", () => {
+  // A real 0x320f:0x823a rejected connection entirely: its `usage 0xff01:1`
+  // collection carries feature report id 7, not the unnumbered report (0)
+  // every other classic-family device uses.
+  const { device } = fakeDevice(VENDOR_ID.gloriousClassicIWired, 0x823a, "Model O 2 Wired Mouse");
+  (device.collections[0].featureReports[0] as { reportId: number }).reportId = 7;
+  assert.equal(GloriousClassicHidClient.isSupported(device), true);
+});
+
+test("a numbered config report is used for every write, not the unnumbered default", async () => {
+  const { device, sent } = fakeDevice(VENDOR_ID.gloriousClassicIWired, 0x823a);
+  (device.collections[0].featureReports[0] as { reportId: number }).reportId = 7;
+  const client = new GloriousClassicHidClient(device);
+
+  await client.setDpi(1600);
+  await client.setPollingRate(500);
+  await client.setLiftOffDistance("High");
+
+  assert.ok(sent.length >= 3);
+  for (const report of sent) assert.equal(report.reportId, 7, "every write should use the discovered report id");
+});
+
+test("a report length other than 64 bytes refuses writes instead of guessing at the layout", async () => {
+  // The real 0x320f:0x823a unit's numbered report 7 declares a 263-byte
+  // length. Resizing the driver's 64-byte payload to fit no longer errors
+  // at the WebHID level, but a diagnostic confirmed the mouse silently
+  // ignores it - the write ACKs and nothing on the mouse changes. Refuse
+  // instead of sending a payload with an unconfirmed byte layout.
+  const { device, sent } = fakeDevice(VENDOR_ID.gloriousClassicIWired, 0x823a);
+  const report = device.collections[0].featureReports[0] as { reportId: number; items: Array<{ reportSize: number; reportCount: number }> };
+  report.reportId = 7;
+  report.items = [{ reportSize: 8, reportCount: 263 }];
+  const client = new GloriousClassicHidClient(device);
+
+  assert.deepEqual(client.getDpiOptions(), []);
+  assert.deepEqual(client.getSupportedPollingRates(), []);
+  await assert.rejects(() => client.setDpi(1600), /not confirmed/);
+  await assert.rejects(() => client.setPollingRate(500), /not confirmed/);
+  await assert.rejects(() => client.setLiftOffDistance("High"), /not confirmed/);
+  await assert.rejects(() => client.setDebounceTime(4), /not confirmed/);
+  await assert.rejects(() => client.setRgb({ effect: "solid", rate: 0, colors: ["#ff0000"] }), /not confirmed/);
+  assert.equal(sent.length, 0, "nothing should be sent once the report length is unconfirmed");
+
+  const status = await client.readStatus();
+  assert.equal(status.dpi, 0);
+  assert.equal(status.pollingRateHz, 0);
+  assert.equal(status.liftOffDistance, null);
+});
+
 test("rejects an unrecognized VID/PID pair", () => {
   const { device } = fakeDevice(VENDOR_ID.gloriousO3, 0x1234);
   assert.equal(GloriousClassicHidClient.isSupported(device), false);

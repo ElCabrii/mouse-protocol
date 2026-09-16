@@ -32,8 +32,18 @@ import { GLORIOUS_CLASSIC_PRODUCTS, VENDOR_ID } from "../vendors.ts";
  * D-, Model I, Model O V2 — plus the newer "core2" 8000Hz-class mice, Model
  * O3 Wireless and Model D 2 PRO 4K/8KHz Edition, on a reduced feature set —
  * see the `generation` doc comment on `GLORIOUS_CLASSIC_PRODUCTS` in
- * vendors.ts for why). The config channel is an unnumbered 64-byte feature
- * report; see ../../glorious-classic/index.ts for the payload layout.
+ * vendors.ts for why). The config channel is a feature report, usually 64
+ * bytes and unnumbered (id 0), but a real "Model O 2 Wired Mouse"
+ * (0x320f:0x823a) instead carries it as numbered report 7 at a 263-byte
+ * declared length. Both the report id and byte length are read from the
+ * device's own descriptor rather than assumed, so it connects - but every
+ * payload below is only reverse-engineered against the 64-byte case, and a
+ * diagnostic confirmed the mouse silently ignores a 64-byte payload just
+ * zero-padded out to 263 (WebHID's write succeeds; nothing changes on the
+ * mouse). See isConfirmedReportLength()'s doc comment: writes are refused
+ * for any length this driver hasn't confirmed a real byte layout for,
+ * rather than guessing again. See ../../glorious-classic/index.ts for the
+ * payload layout, which does not depend on the report id.
  *
  * DPI, polling rate, lift-off distance, and RGB are all write-only on this
  * protocol (neither glorious-ctl nor mxw, the two tools this was ported
@@ -82,10 +92,20 @@ const DEFAULT_STATE: GloriousClassicState = {
 export class GloriousClassicHidClient {
   readonly pollIntervalMs = 0;
   readonly device: HIDDevice;
+  /**
+   * The vendor collection's feature report id and byte length, read from the
+   * device at connect time rather than assumed - see isConfirmedReportLength()
+   * for why a length other than 64 means writes get refused instead of guessed at.
+   */
+  private readonly reportId: number;
+  private readonly reportLength: number;
   private lastRgb: GloriousClassicRgb = GLORIOUS_CLASSIC_DEFAULT_RGB;
 
   constructor(device: HIDDevice) {
     this.device = device;
+    const config = GloriousClassicHidClient.findConfigReport(device);
+    this.reportId = config?.reportId ?? GLORIOUS_CLASSIC_REPORT_ID;
+    this.reportLength = config?.length ?? GLORIOUS_CLASSIC_PACKET_LENGTH;
   }
 
   static isSupported(device: HIDDevice): boolean {
@@ -94,13 +114,41 @@ export class GloriousClassicHidClient {
       && device.vendorId !== VENDOR_ID.gloriousClassicIWired
       && device.vendorId !== VENDOR_ID.gloriousO3) return false;
     if (!GLORIOUS_CLASSIC_PRODUCTS.has(device.productId)) return false;
-    return device.collections.some((collection) => this.hasConfigReport(collection));
+    return this.findConfigReport(device) !== null;
   }
 
-  private static hasConfigReport(collection: HIDCollectionInfo): boolean {
-    const matchesHere = CLASSIC_USAGE_PAGES.includes(collection.usagePage)
-      && collection.featureReports.some((report) => report.reportId === GLORIOUS_CLASSIC_REPORT_ID);
-    return matchesHere || collection.children.some((child) => this.hasConfigReport(child));
+  /** The feature-report id and byte length carried by the config channel collection, or null. */
+  private static findConfigReport(device: HIDDevice): { reportId: number; length: number } | null {
+    for (const collection of device.collections) {
+      const found = this.findConfigReportIn(collection);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+
+  private static findConfigReportIn(collection: HIDCollectionInfo): { reportId: number; length: number } | null {
+    if (CLASSIC_USAGE_PAGES.includes(collection.usagePage) && collection.featureReports.length > 0) {
+      const report = collection.featureReports[0];
+      const bits = report.items.reduce((sum, item) => sum + (item.reportSize ?? 0) * (item.reportCount ?? 0), 0);
+      return { reportId: report.reportId, length: bits > 0 ? Math.ceil(bits / 8) : GLORIOUS_CLASSIC_PACKET_LENGTH };
+    }
+    for (const child of collection.children) {
+      const found = this.findConfigReportIn(child);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+
+  /** Resizes a payload (always built at GLORIOUS_CLASSIC_PACKET_LENGTH) to the device's real declared length. */
+  private fitPayload(payload: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> {
+    if (payload.length === this.reportLength) return payload;
+    const resized = new Uint8Array(this.reportLength);
+    resized.set(payload.subarray(0, Math.min(payload.length, this.reportLength)));
+    return resized;
+  }
+
+  private async send(payload: Uint8Array<ArrayBuffer>): Promise<void> {
+    await this.device.sendFeatureReport(this.reportId, this.fitPayload(payload));
   }
 
   async open(): Promise<void> {
@@ -129,15 +177,38 @@ export class GloriousClassicHidClient {
     return GLORIOUS_CLASSIC_PRODUCTS.get(this.device.productId)?.generation === "core2";
   }
 
+  /**
+   * Every payload builder in glorious-classic/index.ts was reverse-engineered
+   * against the 64-byte feature report every classic-line unit confirmed so
+   * far uses. A real 0x320f:0x823a instead declares a 263-byte report;
+   * resizing our 64-byte payload to fit sends without a WebHID error, but a
+   * diagnostic confirmed the mouse ignores it outright - the firmware ACKs
+   * the write and changes nothing. A report length this driver hasn't seen a
+   * real byte layout for is therefore not writable yet, even though it
+   * connects and its report id is known - see [[glorious-classic-protocol]]
+   * in memory. Refuse instead of guessing again until a capture of the
+   * device's own official software gives the real layout.
+   */
+  private isConfirmedReportLength(): boolean {
+    return this.reportLength === GLORIOUS_CLASSIC_PACKET_LENGTH;
+  }
+
+  private assertWritable(feature: string): void {
+    if (this.isCore2()) throw new Error(`${feature} is not confirmed on this mouse's newer protocol generation yet.`);
+    if (!this.isConfirmedReportLength()) {
+      throw new Error(`${feature} is not confirmed on this unit's ${this.reportLength}-byte feature report yet.`);
+    }
+  }
+
   getDpiOptions(): number[] {
-    if (this.isCore2()) return [];
+    if (this.isCore2() || !this.isConfirmedReportLength()) return [];
     const options: number[] = [];
     for (let dpi = GLORIOUS_CLASSIC_DPI_MIN; dpi <= GLORIOUS_CLASSIC_DPI_MAX; dpi += 50) options.push(dpi);
     return options;
   }
 
   getSupportedPollingRates(): number[] {
-    if (this.isCore2()) return [];
+    if (this.isCore2() || !this.isConfirmedReportLength()) return [];
     return GLORIOUS_CLASSIC_POLLING_RATES.map(([, hertz]) => hertz).sort((left, right) => left - right);
   }
 
@@ -147,7 +218,8 @@ export class GloriousClassicHidClient {
     const battery = this.isWireless() ? await this.readBattery().catch(() => null) : null;
     const wireless = this.isWireless();
     const core2 = this.isCore2();
-    const liftOffDistance = core2 ? null : LIFT_OFF_DISTANCES.find(([mm]) => mm === state.lodMm)?.[1] ?? "Medium";
+    const restricted = core2 || !this.isConfirmedReportLength();
+    const liftOffDistance = restricted ? null : LIFT_OFF_DISTANCES.find(([mm]) => mm === state.lodMm)?.[1] ?? "Medium";
     return {
       brand: "Glorious",
       name: this.displayName(),
@@ -156,10 +228,10 @@ export class GloriousClassicHidClient {
       batteryState: battery
         ? (battery.state === "Normal" && battery.charging ? "Charging" : BATTERY_STATE_LABEL[battery.state])
         : "Unknown",
-      dpi: core2 ? 0 : state.stageDpis[state.activeStage] ?? state.stageDpis[0] ?? 800,
-      pollingRateHz: core2 ? 0 : gloriousClassicDecodePollingRate(state.pollingIntervalMs) ?? 1000,
+      dpi: restricted ? 0 : state.stageDpis[state.activeStage] ?? state.stageDpis[0] ?? 800,
+      pollingRateHz: restricted ? 0 : gloriousClassicDecodePollingRate(state.pollingIntervalMs) ?? 1000,
       supportedPollingRates: this.getSupportedPollingRates(),
-      activeProfile: core2 ? null : state.profileId,
+      activeProfile: restricted ? null : state.profileId,
       connectionType: wireless ? "Wireless" : "Wired",
       connectionDetail: wireless
         ? "2.4 GHz / Bluetooth · settings are write-only, not read back"
@@ -171,9 +243,7 @@ export class GloriousClassicHidClient {
   }
 
   async setDpi(dpi: number): Promise<number> {
-    if (this.isCore2()) {
-      throw new Error("DPI is not confirmed on this mouse's newer protocol generation yet.");
-    }
+    this.assertWritable("DPI");
     if (!Number.isFinite(dpi) || dpi < GLORIOUS_CLASSIC_DPI_MIN || dpi > GLORIOUS_CLASSIC_DPI_MAX) {
       throw new Error(`DPI must be between ${GLORIOUS_CLASSIC_DPI_MIN} and ${GLORIOUS_CLASSIC_DPI_MAX}.`);
     }
@@ -181,54 +251,49 @@ export class GloriousClassicHidClient {
     const rounded = Math.round(dpi);
     state.stageDpis[state.activeStage] = rounded;
     await this.open();
-    await this.device.sendFeatureReport(
-      GLORIOUS_CLASSIC_REPORT_ID,
-      buildGloriousClassicDpiStagesPayload(state.stageDpis, state.profileId),
-    );
-    await this.device.sendFeatureReport(
-      GLORIOUS_CLASSIC_REPORT_ID,
-      buildGloriousClassicActiveStagePayload(state.activeStage + 1, state.profileId),
-    );
+    await this.send(buildGloriousClassicDpiStagesPayload(state.stageDpis, state.profileId));
+    await this.send(buildGloriousClassicActiveStagePayload(state.activeStage + 1, state.profileId));
     this.saveState(state);
     return rounded;
   }
 
   async setPollingRate(pollingRateHz: number): Promise<number> {
-    if (this.isCore2()) {
-      throw new Error("Polling rate is not confirmed on this mouse's newer protocol generation yet.");
-    }
+    this.assertWritable("Polling rate");
     const intervalMs = gloriousClassicEncodePollingRate(pollingRateHz);
     if (intervalMs === null) throw new Error(`This mouse does not support ${pollingRateHz} Hz.`);
     const state = this.loadState();
     await this.open();
-    await this.device.sendFeatureReport(GLORIOUS_CLASSIC_REPORT_ID, buildGloriousClassicPollingRatePayload(intervalMs));
+    await this.send(buildGloriousClassicPollingRatePayload(intervalMs));
     state.pollingIntervalMs = intervalMs;
     this.saveState(state);
     return pollingRateHz;
   }
 
   async setLiftOffDistance(value: NonNullable<MouseStatus["liftOffDistance"]>): Promise<NonNullable<MouseStatus["liftOffDistance"]>> {
-    if (this.isCore2()) {
-      throw new Error("Lift-off distance is not confirmed on this mouse's newer protocol generation yet.");
-    }
+    this.assertWritable("Lift-off distance");
     const millimetres = LIFT_OFF_DISTANCES.find(([, name]) => name === value)?.[0];
     if (!millimetres) throw new Error(`This mouse does not support a ${value.toLowerCase()} lift-off distance.`);
     const state = this.loadState();
     await this.open();
-    await this.device.sendFeatureReport(GLORIOUS_CLASSIC_REPORT_ID, buildGloriousClassicLiftOffPayload(millimetres));
+    await this.send(buildGloriousClassicLiftOffPayload(millimetres));
     state.lodMm = millimetres;
     this.saveState(state);
     return value;
   }
 
   async setDebounceTime(milliseconds: number): Promise<number> {
+    // Unlike DPI/polling/LOD, core2 does write debounce - so this only gates
+    // on report length, not isCore2().
+    if (!this.isConfirmedReportLength()) {
+      throw new Error(`Debounce is not confirmed on this unit's ${this.reportLength}-byte feature report yet.`);
+    }
     if (!Number.isFinite(milliseconds) || milliseconds < 0 || milliseconds > GLORIOUS_CLASSIC_DEBOUNCE_MAX_MS) {
       throw new Error(`Debounce must be between 0 and ${GLORIOUS_CLASSIC_DEBOUNCE_MAX_MS} ms.`);
     }
     const state = this.loadState();
     const clamped = Math.round(milliseconds);
     await this.open();
-    await this.device.sendFeatureReport(GLORIOUS_CLASSIC_REPORT_ID, buildGloriousClassicDebouncePayload(clamped, state.profileId));
+    await this.send(buildGloriousClassicDebouncePayload(clamped, state.profileId));
     state.debounceMs = clamped;
     this.saveState(state);
     return clamped;
@@ -239,16 +304,21 @@ export class GloriousClassicHidClient {
   }
 
   async setRgb(rgb: GloriousClassicRgb): Promise<GloriousClassicRgb> {
+    // Unlike DPI/polling/LOD, core2 does write RGB - so this only gates on
+    // report length, not isCore2().
+    if (!this.isConfirmedReportLength()) {
+      throw new Error(`RGB is not confirmed on this unit's ${this.reportLength}-byte feature report yet.`);
+    }
     await this.open();
-    await this.device.sendFeatureReport(GLORIOUS_CLASSIC_REPORT_ID, buildGloriousClassicRgbPayload(rgb));
+    await this.send(buildGloriousClassicRgbPayload(rgb));
     this.lastRgb = rgb;
     return rgb;
   }
 
   private async readBattery(): Promise<GloriousClassicBattery> {
-    await this.device.sendFeatureReport(GLORIOUS_CLASSIC_REPORT_ID, buildGloriousClassicBatteryRequestPayload());
+    await this.send(buildGloriousClassicBatteryRequestPayload());
     await this.delay(BATTERY_RESPONSE_DELAY_MS);
-    const view = await this.device.receiveFeatureReport(GLORIOUS_CLASSIC_REPORT_ID);
+    const view = await this.device.receiveFeatureReport(this.reportId);
     const body = new Uint8Array(view.buffer, view.byteOffset, Math.min(view.byteLength, GLORIOUS_CLASSIC_PACKET_LENGTH));
     return parseGloriousClassicBatteryResponse(body);
   }
@@ -268,6 +338,8 @@ export class GloriousClassicHidClient {
       forceShowBattery: this.isWireless(),
       statusNote: this.isCore2()
         ? "This mouse's newer protocol generation only has confirmed commands for RGB, debounce, and battery — DPI, polling rate, and lift-off distance aren't wired in yet."
+        : !this.isConfirmedReportLength()
+        ? `This mouse connects, but its ${this.reportLength}-byte feature report uses a byte layout this driver hasn't confirmed yet — no settings can be changed until a real capture is available.`
         : "DPI, polling rate, lift-off distance and RGB are written to this mouse but never read back.",
     };
   }
