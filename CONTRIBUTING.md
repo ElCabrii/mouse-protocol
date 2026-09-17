@@ -141,6 +141,12 @@ In its description, include:
 - any unknown fields or assumptions that remain;
 - the matching OpenMouse pull request when application changes are required.
 
+Commit subjects on `main` are release inputs and must follow Conventional
+Commits. When a pull request is squash-merged, its title becomes that subject.
+Use `fix:` for a patch release, `feat:` for a minor release, and `!` or a
+`BREAKING CHANGE:` footer for an incompatible API change. Documentation, test,
+and maintenance-only changes do not publish a package release.
+
 Before requesting review, confirm that:
 
 - `npm run check` passes in this repository;
@@ -152,3 +158,10 @@ Before requesting review, confirm that:
 Small, evidence-backed improvements are welcome even when a protocol is not yet
 fully understood. Documenting an unknown accurately is better than assigning it
 a guessed meaning.
+
+## Releases
+
+Release Please collects releasable commits into a version pull request. Merging
+that pull request creates the matching GitHub release and publishes the exact
+commit as `@openmouse/protocol`. Do not edit package versions or create release
+tags by hand.

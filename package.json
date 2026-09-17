@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Gaming mouse protocol codecs and WebHID drivers used by OpenMouse.",
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "dist",
     "README.md",
