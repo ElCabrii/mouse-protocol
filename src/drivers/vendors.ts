@@ -91,9 +91,16 @@ import {
   HYPERX_VENDOR_ID_KINGSTON,
 } from "@openmouse/protocol/hyperx";
 import { RAWM_PRODUCT_IDS, RAWM_USAGE, RAWM_USAGE_PAGE, RAWM_VENDOR_ID } from "@openmouse/protocol/rawm";
+import {
+  RYUNIX_PRODUCT_IDS,
+  RYUNIX_USAGE,
+  RYUNIX_USAGE_PAGE,
+  RYUNIX_VENDOR_ID,
+} from "@openmouse/protocol/ryunix";
 
 export const VENDOR_ID = {
   asus: ASUS_VENDOR_ID,
+  ryunix: RYUNIX_VENDOR_ID,
   pulsar: 0x3710,
   endgameGear: 0x3367,
   wlmouse: 0x36a7,
@@ -641,6 +648,13 @@ export const HYPERX_HID_FILTERS: HIDDeviceFilter[] = [
   ...HYPERX_KINGSTON_HID_FILTERS,
   ...HYPERX_HP_HID_FILTERS,
 ];
+export const RYUNIX_HID_FILTERS: HIDDeviceFilter[] = [...RYUNIX_PRODUCT_IDS].map((productId) => ({
+  vendorId: RYUNIX_VENDOR_ID,
+  productId,
+  usagePage: RYUNIX_USAGE_PAGE,
+  usage: RYUNIX_USAGE,
+}));
+
 
 export const SUPPORTED_HID_FILTERS: HIDDeviceFilter[] = [
   ...ASUS_GLADIUS_II_HID_FILTERS,
@@ -737,4 +751,5 @@ export const SUPPORTED_HID_FILTERS: HIDDeviceFilter[] = [
   ...MICROSOFT_HID_FILTERS,
   ...INCOTT_HID_FILTERS,
   ...HYPERX_HID_FILTERS,
+  ...RYUNIX_HID_FILTERS,
 ];
