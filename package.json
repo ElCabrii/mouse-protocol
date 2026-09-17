@@ -6,6 +6,11 @@
   "publishConfig": {
     "access": "public"
   },
+  "release": {
+    "branches": [
+      "main"
+    ]
+  },
   "files": [
     "dist",
     "README.md",
@@ -177,6 +182,7 @@
     "prepare": "npm run build"
   },
   "devDependencies": {
+    "semantic-release": "25.0.9",
     "tsx": "^4.23.11",
     "typescript": "^5.8.3"
   },

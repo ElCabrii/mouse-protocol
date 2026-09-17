@@ -161,7 +161,8 @@ a guessed meaning.
 
 ## Releases
 
-Release Please collects releasable commits into a version pull request. Merging
-that pull request creates the matching GitHub release and publishes the exact
-commit as `@openmouse/protocol`. Do not edit package versions or create release
-tags by hand.
+After `main` passes CI, semantic-release determines the next version from the
+commits since the previous tag, creates the matching GitHub release, and
+publishes the exact commit as `@openmouse/protocol`. No release pull request or
+manual merge is required. Do not edit package versions or create release tags
+by hand.
