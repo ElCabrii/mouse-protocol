@@ -13,8 +13,12 @@ import {
 import { RedragonHidClient } from "./hid.ts";
 
 type Sent = { reportId: number; data: Uint8Array };
+interface FakeConfigCollection extends HIDCollectionInfo {
+  echo: Uint8Array;
+}
 
-function configCollection(echo: Uint8Array = new Uint8Array([0x08, 0x40, 0, 0, 0, 0xfa, 0xfa])) {
+
+function configCollection(echo: Uint8Array = new Uint8Array([0x08, 0x40, 0, 0, 0, 0xfa, 0xfa])): FakeConfigCollection {
   return {
     usagePage: REDRAGON_CONFIG_USAGE_PAGE,
     usage: REDRAGON_CONFIG_USAGE,
@@ -31,14 +35,16 @@ class FakeRedragonDevice {
   productId = 0xfc7a;
   productName = "USB Gaming Mouse";
   opened = false;
-  collections: ReturnType<typeof configCollection>[] = [configCollection()];
+  collections: FakeConfigCollection[] = [configCollection()];
   readonly sent: Sent[] = [];
+  failOnSend: number | null = null;
 
   async open(): Promise<void> { this.opened = true; }
   async close(): Promise<void> { this.opened = false; }
 
   async sendFeatureReport(reportId: number, data: BufferSource): Promise<void> {
     this.sent.push({ reportId, data: new Uint8Array(data as ArrayBufferLike) });
+    if (this.sent.length === this.failOnSend) throw new Error("simulated transport failure");
   }
 
   async receiveFeatureReport(reportId: number): Promise<DataView> {
@@ -175,6 +181,19 @@ test("setDpiStageValue pushes table + commit block in one bracket", async () => 
     );
   }
   assert.deepEqual([...fake.sent[11]!.data], [0xf5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  const status = await client.readStatus();
+  assert.deepEqual(status.dpiStages, [800, 2400, 3500, 5500, 12400]);
+});
+
+test("failed DPI writes close the session and preserve cached stages", async () => {
+  const fake = new FakeRedragonDevice();
+  const client = new RedragonHidClient(asDevice(fake));
+  await client.setDpiStageValue(0, 800);
+
+  fake.failOnSend = fake.sent.length + 3;
+  await assert.rejects(() => client.setDpiStageValue(1, 1600), /simulated transport failure/);
+  assert.deepEqual([...fake.sent.at(-1)!.data], [0xf5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
   const status = await client.readStatus();
   assert.deepEqual(status.dpiStages, [800, 2400, 3500, 5500, 12400]);
 });

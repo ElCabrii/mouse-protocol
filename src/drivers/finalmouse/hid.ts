@@ -188,13 +188,12 @@ export class FinalmouseHidClient {
   private async waitForReport(afterRevision: number, timeoutMs: number): Promise<void> {
     if (this.reportRevision > afterRevision) return;
     await new Promise<void>((resolve) => {
-      let timer: ReturnType<typeof setTimeout> | 0 = 0;
       const finish = (): void => {
         clearTimeout(timer);
         this.reportWaiters.delete(finish);
         resolve();
       };
-      timer = setTimeout(finish, timeoutMs);
+      const timer = setTimeout(finish, timeoutMs);
       this.reportWaiters.add(finish);
     });
   }

@@ -136,16 +136,16 @@ export class RedragonHidClient {
     redragonEncodeDpiSlot(REDRAGON_PROFILE0, stage, dpi);
     await this.run(async () => {
       await this.open();
-      const next = this.lastStages ?? [...FACTORY_STAGES];
+      const next = [...(this.lastStages ?? FACTORY_STAGES)];
       next[stage] = dpi;
-      await this.sendSessionFrame(true);
-      for (let level = 0; level < REDRAGON_PROFILE0_DPI_SUBCMDS.length; level++) {
-        await this.sendFrame(redragonEncodeDpiSlot(REDRAGON_PROFILE0, level, next[level]!));
-      }
-      for (const code of REDRAGON_COMMIT_CODES) {
-        await this.sendFrame(redragonEncodeCommit(code));
-      }
-      await this.sendSessionFrame(false);
+      await this.writeSession(async () => {
+        for (let level = 0; level < REDRAGON_PROFILE0_DPI_SUBCMDS.length; level++) {
+          await this.sendFrame(redragonEncodeDpiSlot(REDRAGON_PROFILE0, level, next[level]!));
+        }
+        for (const code of REDRAGON_COMMIT_CODES) {
+          await this.sendFrame(redragonEncodeCommit(code));
+        }
+      });
       this.lastStages = next;
     });
     return dpi;
@@ -160,12 +160,12 @@ export class RedragonHidClient {
     const frame = redragonEncodePollingRate(hz);
     await this.run(async () => {
       await this.open();
-      await this.sendSessionFrame(true);
-      await this.sendFrame(frame);
-      for (const code of REDRAGON_COMMIT_CODES) {
-        await this.sendFrame(redragonEncodeCommit(code));
-      }
-      await this.sendSessionFrame(false);
+      await this.writeSession(async () => {
+        await this.sendFrame(frame);
+        for (const code of REDRAGON_COMMIT_CODES) {
+          await this.sendFrame(redragonEncodeCommit(code));
+        }
+      });
       this.lastPollingHz = hz;
     });
     return hz;
@@ -192,15 +192,20 @@ export class RedragonHidClient {
 
   private async sendFrame(frame: Uint8Array): Promise<void> {
     await this.device.sendFeatureReport(REDRAGON_REPORT_ID, frame.slice(1).buffer as ArrayBuffer);
-    await this.delay(WRITE_DELAY_MS);
+    await new Promise((resolve) => setTimeout(resolve, WRITE_DELAY_MS));
   }
 
   private async sendSessionFrame(begin: boolean): Promise<void> {
     await this.sendFrame(begin ? redragonHello() : redragonSession(false));
   }
 
-  private delay(milliseconds: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  private async writeSession(operation: () => Promise<void>): Promise<void> {
+    await this.sendSessionFrame(true);
+    try {
+      await operation();
+    } finally {
+      await this.sendSessionFrame(false);
+    }
   }
 
   private async run<T>(operation: () => Promise<T>): Promise<T> {

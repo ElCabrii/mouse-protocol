@@ -84,7 +84,8 @@ Per-code semantics unknown; the block is sent whole, vendor order.
 - [x] `isSupported` shape (`04d9:fc7a` + `0xFFA0:0x01` + feature 2) matches
       the connected mouse (usbhid-dump descriptor).
 - [x] `FA FA` echo answers on `/dev/hidraw2` (MI_02).
-- [ ] WebHID `readStatus` against the real device (needs a Chrome picker
-      click; blocked on manual step).
-- [ ] `setDpiStageValue` round-trip felt on hardware (same manual step).
-- [ ] Flip `REDRAGON_PRODUCTS` `verified` to `true` after the above pass.
+- [x] WebHID `readStatus` passed the `FA FA` echo probe on hardware.
+- [x] `setDpiStageValue` was felt live at 400, 800, 1200, 2400, 2800,
+      and 4000 DPI.
+- [x] Polling writes were felt live at 125 and 1000 Hz.
+- [x] `REDRAGON_PRODUCTS` marks the hardware-tested PID as verified.
