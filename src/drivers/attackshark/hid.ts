@@ -12,7 +12,7 @@ import {
   X11_DPI_REPORT_ID,
   X11_DPI_STAGE_COUNT,
   X11_DPI_STEP,
-} from "./dpi.ts";
+} from "../../compx/x11-dpi.ts";
 
 // Attack Shark mice ship from multiple OEMs with different VIDs and protocols:
 //
@@ -235,6 +235,7 @@ type ProtocolFamily = "1d57" | "1d57-x11" | "25a7" | "373e" | null;
 
 function detectFamily(device: HIDDevice): ProtocolFamily {
   if (device.vendorId === VID_1D57) {
+    if (/delux/i.test(device.productName || "")) return null;
     // Native HID adapters (Tauri's TauriHidDevice, the Node/Bridge adapter)
     // cannot parse the report descriptor and report no collections at all,
     // so every collection-based gate below would refuse these units. On that
