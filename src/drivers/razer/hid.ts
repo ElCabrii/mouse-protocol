@@ -95,13 +95,20 @@ const LOW_POWER_OPTIONS: readonly number[] = Array.from(
 const LOW_POWER_MAX_POLLING_HZ = 1000;
 
 /**
- * Razer exposes its control channel on the interface whose only collection is
- * Generic Desktop Mouse. Every other interface either belongs to a different
- * function or is a protected collection the browser will not talk to.
+ * Razer exposes its control channel on the interface that declares a Generic
+ * Desktop Mouse collection. WebHID groups each top-level collection into its
+ * own `HIDDevice`, so there this collection is always alone; a native
+ * (hidapi) host instead groups every top-level collection an interface
+ * declares onto one `HIDDevice`, and the interface that answers Razer's
+ * feature-report commands can carry several — e.g. Consumer Control
+ * alongside Generic Desktop Mouse on the DeathAdder V3 HyperSpeed. Requiring
+ * it to be the *only* collection made every interface a native host can
+ * offer fail this check for that model; checking for its presence instead
+ * accepts both hosts' shapes without weakening what browsers ever hand this
+ * function.
  */
 function isMouseControlInterface(device: HIDDevice): boolean {
-  const [collection, ...rest] = device.collections;
-  return rest.length === 0 && collection?.usagePage === 0x01 && collection?.usage === 0x02;
+  return device.collections.some((collection) => collection.usagePage === 0x01 && collection.usage === 0x02);
 }
 
 /**
@@ -191,8 +198,8 @@ export class RazerHidClient {
   /**
    * Whether this collection actually answers the Razer protocol, tried by
    * sending the firmware-version read rather than inferred from the
-   * collection's declared shape. `isSupported()`'s shape check (single
-   * collection, Generic Desktop Mouse) is right for every model verified so
+   * collection's declared shape. `isSupported()`'s shape check (a Generic
+   * Desktop Mouse collection present) is right for every model verified so
    * far, but WebHID does not validate report ids against the descriptor (see
    * the note atop codec.ts), so a collection that fails the shape check can
    * still genuinely answer report 0 — used as a fallback in

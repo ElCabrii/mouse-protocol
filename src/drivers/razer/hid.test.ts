@@ -612,6 +612,26 @@ test("a nativeOnly model is never accepted, whatever the interface shape", () =>
   assert.equal(RazerHidClient.isSupported(vendor), false);
 });
 
+test("a native host's grouped interface is accepted alongside its other collections", () => {
+  // A native (hidapi) host groups every top-level collection an interface
+  // declares onto one HIDDevice, unlike WebHID which hands the Generic
+  // Desktop Mouse collection over alone. The DeathAdder V3 HyperSpeed's
+  // control interface answers Razer's commands despite also declaring a
+  // Consumer Control collection — see issue #112.
+  // Arrange
+  const grouped = {
+    vendorId: 0x1532,
+    productId: 0x00c4,
+    collections: [
+      { usagePage: 0x01, usage: 0x02, featureReports: [], children: [] },
+      { usagePage: 0x0c, usage: 0x01, featureReports: [], children: [] },
+    ],
+  } as unknown as HIDDevice;
+
+  // Act / Assert
+  assert.equal(RazerHidClient.isSupported(grouped), true);
+});
+
 test("the DeathAdder V2 caps DPI at 20000", () => {
   // Arrange
   const { client } = fakeMouse({ tracking: 0, liftOff: 16, landing: 11, asymmetric: false }, { productId: 0x0084 });
