@@ -235,6 +235,7 @@ export class AtkHidClient {
   }
 
   getSupportedPollingRates(): number[] {
+    if (this.usesAtk1kReceiver()) return POLLING_RATES.map(([, hertz]) => hertz).filter((hertz) => hertz <= 1000);
     return this.usesR1LiveSettings()
       ? [...ATK_VXE_R1_POLLING_RATES]
       : this.isR1()
@@ -463,6 +464,9 @@ export class AtkHidClient {
   }
 
   async setPollingRate(pollingRateHz: number): Promise<number> {
+    if (this.usesAtk1kReceiver() && !this.getSupportedPollingRates().includes(pollingRateHz)) {
+      throw new Error(`This receiver does not support ${pollingRateHz} Hz.`);
+    }
     if (!this.usesR1LiveSettings()) await this.identify();
     if (this.usesR1LiveSettings()) return await this.setR1PollingRate(pollingRateHz);
     const encoded = POLLING_RATES.find(([, hertz]) => hertz === pollingRateHz);
@@ -1280,7 +1284,14 @@ export class AtkHidClient {
       const decoded = settings ? atkDecodeVxeR1PollingCode(settings[1]) : null;
       return decoded ?? 1000;
     }
-    return this.decodePollingRate((system ?? await this.read(REGISTER.system, SYSTEM_LENGTH))[0]!);
+    const rate = this.decodePollingRate((system ?? await this.read(REGISTER.system, SYSTEM_LENGTH))[0]!);
+    // The mouse can retain its 8K setting when moved to the 1K receiver.
+    // Report the transport ceiling, not an impossible rate from stored settings.
+    return this.usesAtk1kReceiver() ? Math.min(rate, 1000) : rate;
+  }
+
+  private usesAtk1kReceiver(): boolean {
+    return this.device.vendorId === VENDOR_ID.atk && this.device.productId === 0x101a;
   }
 
   /**

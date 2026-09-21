@@ -746,8 +746,9 @@ test("X1 Pro Max DPI writes use the PAW3950 encoding and confirm readback", asyn
   assert.equal(sumFrame(8, frame), 0x55);
 });
 
-test("X1 Pro Max captured receiver settings match ATK HUB", async () => {
-  const fake = device(0x101b, "ATK Mouse 8K Dongle");
+for (const pid of [0x101a, 0x101b]) {
+test(`X1 Pro Max captured settings respect receiver ${pid.toString(16)} capabilities`, async () => {
+  const fake = device(pid, pid === 0x101a ? "ATK Mouse 1K Dongle" : "ATK Mouse 8K Dongle");
   (fake as unknown as FakeAtkDevice).replies = [
     reply(0x10, 0, [2, 39, 44]),
     reply(0x04, 0, [25, 0]),
@@ -763,7 +764,9 @@ test("X1 Pro Max captured receiver settings match ATK HUB", async () => {
   const status = await client.readStatus();
   assert.equal(status.dpi, 1200);
   assert.deepEqual(status.dpiStages, [800, 1200]);
-  assert.equal(status.pollingRateHz, 8000);
+  assert.equal(status.pollingRateHz, pid === 0x101a ? 1000 : 8000);
+  assert.deepEqual(status.supportedPollingRates, pid === 0x101a
+    ? [125, 250, 500, 1000] : [125, 250, 500, 1000, 2000, 4000, 8000]);
   assert.equal(status.liftOffDistance, "High");
   assert.equal(status.liftOffScale, undefined);
   assert.equal(status.angleSnapping, true);
@@ -778,6 +781,23 @@ test("X1 Pro Max captured receiver settings match ATK HUB", async () => {
   await assert.rejects(client.setSleepTimeout(600), /does not support/);
   await assert.rejects(client.setDebounceTime(3), /does not support/);
   await assert.rejects(client.setLiftOffScale(4), /does not support/);
+});
+}
+
+test("ATK 1K receiver rejects high polling rates before any HID command", async () => {
+  const fake = device(0x101a, "ATK Mouse 1K Dongle");
+  const client = new AtkHidClient(fake);
+  for (const rate of [2000, 4000, 8000]) await assert.rejects(client.setPollingRate(rate), /receiver does not support/);
+  assert.equal((fake as unknown as FakeAtkDevice).sent.length, 0);
+});
+
+test("ATK 1K receiver writes and confirms a supported polling rate", async () => {
+  const fake = device(0x101a, "ATK Mouse 1K Dongle");
+  (fake as unknown as FakeAtkDevice).replies = [
+    reply(0x10, 0, [2, 39]), reply(0x08, 0, [2, 0x53, 2, 0x53, 1, 0x54]),
+  ];
+  assert.equal(await new AtkHidClient(fake).setPollingRate(500), 500);
+  assert.deepEqual(Array.from(wrote(fake).subarray(2, 7)), [0, 0, 2, 2, 0x53]);
 });
 
 test("X1 Pro Max lift-off uses discrete 0.7, 1 and 2 mm codes", async () => {

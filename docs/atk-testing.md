@@ -36,6 +36,16 @@ the exact additional DPI/rate values and button remapping were not verified.
 Browser UI operation over the cable has not yet been tested. Lighting and
 long-range controls are not implemented for this model.
 
+The owner also tested the stock `373b:101a` ATK Mouse 1K Dongle (USB
+`bcdDevice 0211`) and reported normal operation, but found the UI offered
+8,000 Hz despite the 1K transport limit. This receiver now offers only 125,
+250, 500 and 1,000 Hz, rejects higher-rate writes before sending a command,
+and caps the reported rate at 1,000 Hz if the mouse retains an 8K setting.
+The local browser displayed 1,200 DPI and 1,000 Hz after this correction.
+This is a configured rate capped by the receiver's limit, not a measured
+physical polling frequency. The raw read/write traces below cover only the
+cable and 8K receiver; the new 1K rate regression tests use synthetic replies.
+
 | Connection | VID:PID | Product | USB bcdDevice | Mouse firmware |
 | --- | --- | --- | --- | --- |
 | Cable | `373b:1017` | ATK X1 PRO MAX | `0218` | 2.18 |
