@@ -25,8 +25,16 @@ Sources: [ATK HUB](https://hub.atk.pro/) and its
 The owner confirmed 1,200 DPI and 8,000 Hz and supplied the HUB settings view.
 
 Hardware verification on 2026-09-21 used the actual `AtkHidClient` through a
-native HID adapter implementing its WebHID-shaped transport. Browser WebHID
-UI interaction and physical polling-frequency measurements were not tested.
+native HID adapter implementing its WebHID-shaped transport. Physical
+polling-frequency measurements were not tested.
+
+On 2026-09-22, the owner additionally tested the locally built OpenMouse web
+UI over the 8K receiver. They reported that all buttons were recognized,
+different DPI and polling-rate settings applied, and settings persisted after
+switching the mouse fully off and on. These are owner-reported observations;
+the exact additional DPI/rate values and button remapping were not verified.
+Browser UI operation over the cable has not yet been tested. Lighting and
+long-range controls are not implemented for this model.
 
 | Connection | VID:PID | Product | USB bcdDevice | Mouse firmware |
 | --- | --- | --- | --- | --- |
